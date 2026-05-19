@@ -141,8 +141,9 @@ pub mod native {
         // Ensure message channel is initialized, otherwise there is no transport
         // and the isolate gets lost.
         MessageChannel::get();
-        // used the port as the identifier of the isolate because this one is always unique
-        let isolate_id = port;
+        let pid = std::process::id() as i64;
+       // Combine pid and port into a single unique i64 id.
+        let isolate_id = (pid << 32) | (port & 0xFFFFFFFF);
         if let Some(transport) = NativeMessageTransport::get() {
             let isolate_id = IsolateId(isolate_id);
             transport.register_isolate(isolate_id, port);
