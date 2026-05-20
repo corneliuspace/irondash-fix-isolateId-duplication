@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+
 use crate::{IsolateId, Value};
 
 pub trait MessageTransport: Send + Sync + 'static {
@@ -13,17 +14,14 @@ pub trait MessageTransportDelegate {
 }
 
 pub mod native {
-  use std::{
-    collections::HashMap,
-    ffi::{c_void, CString},
-    fmt::Debug,
-    sync::{Arc, Mutex},
-    sync::atomic::{AtomicI64, Ordering},
-  };
-  use once_cell::sync::Lazy;
-  use irondash_run_loop::RunLoop;
+    use std::{
+        collections::HashMap,
+        ffi::{c_void, CString},
+        fmt::Debug,
+        sync::{Arc, Mutex},
+    };
 
-  use irondash_dart_ffi::{raw, DartPort, DartValue, NativePort};
+    use irondash_dart_ffi::{raw, DartPort, DartValue, NativePort};
     use once_cell::sync::OnceCell;
 
     use crate::{
@@ -32,11 +30,6 @@ pub mod native {
     };
 
     use super::{MessageTransport, MessageTransportDelegate};
-
-    static ISOLATE_COUNTER: Lazy<AtomicI64> = Lazy::new(|| {
-    let pid = std::process::id() as i64;
-    AtomicI64::new((pid & 0xFFFF) << 32)
-    });
 
     pub struct NativeMessageTransport {
         delegate: Arc<Mutex<dyn MessageTransportDelegate + Send>>,
@@ -73,7 +66,6 @@ pub mod native {
             delegate.on_message(isolate_id, message);
         }
 
-        /// Processes raw native port signals and defers state modifications to the execution run loop to prevent thread pool deadlocks.
         fn on_nativeport_value_received(&self, v: DartValue) {
             if let DartValue::Array(value) = v {
                 let mut iter = value.into_iter();
@@ -84,19 +76,14 @@ pub mod native {
                     let isolate_id = match isolate_id {
                         DartValue::I32(id) => id as i64,
                         DartValue::I64(id) => id,
-                        _ => return,
+                        id => panic!("invalid isolate id {id:?}"),
                     };
-                    let message = message.to_string_lossy().into_owned();
+                    let message = message.to_string_lossy();
                     if message == "isolate_exit" {
-                        if let Some(transport) = NativeMessageTransport::get() {
-                            let isolate_id = IsolateId(isolate_id);
-                            let sender = RunLoop::current().new_sender();
-                            sender.send(move || {
-                                transport.isolate_ports.lock().unwrap().remove(&isolate_id);
-                                let mut delegate = transport.delegate.lock().unwrap();
-                                delegate.on_isolate_exited(isolate_id);
-                            });
-                        }
+                        let isolate_id = IsolateId(isolate_id);
+                        self.isolate_ports.lock().unwrap().remove(&isolate_id);
+                        let mut delegate = self.delegate.lock().unwrap();
+                        delegate.on_isolate_exited(isolate_id);
                     }
                 }
             }
@@ -151,19 +138,18 @@ pub mod native {
 
     // Accepts port, returns isolate id
     pub(crate) extern "C" fn register_isolate(port: i64, _isolate_id: *mut c_void) -> i64 {
-    MessageChannel::get();
-    let isolate_id = ISOLATE_COUNTER.fetch_add(1, Ordering::SeqCst);
-    if let Some(transport) = NativeMessageTransport::get() {
-        let isolate_id_typed = IsolateId(isolate_id);
-        let sender = RunLoop::current().new_sender();
-        sender.send(move || {
-            transport.register_isolate(isolate_id_typed, port);
-        });
-    }
-    isolate_id
+        // Ensure message channel is initialized, otherwise there is no transport
+        // and the isolate gets lost.
+        MessageChannel::get();
+        // used the port as the identifier of the isolate because this one is always unique
+        let isolate_id = port;
+        if let Some(transport) = NativeMessageTransport::get() {
+            let isolate_id = IsolateId(isolate_id);
+            transport.register_isolate(isolate_id, port);
+        }
+        isolate_id
     }
 
-    /// External C-ABI binding invoked by Dart to pass serializable payloads down into the non-blocking Rust native pipeline.
     pub(crate) extern "C" fn post_message(
         isolate_id: crate::ffi::IsolateId,
         message: *mut u8,
@@ -173,10 +159,7 @@ pub mod native {
         if let Some(transport) = NativeMessageTransport::get() {
             let isolate_id = IsolateId(isolate_id);
             let value = unsafe { Deserializer::deserialize(&vec) };
-            let sender = RunLoop::current().new_sender();
-            sender.send(move || {
-                transport.handle_message(isolate_id, value);
-            });
+            transport.handle_message(isolate_id, value);
         }
     }
 }
